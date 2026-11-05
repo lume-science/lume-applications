@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lume-applications"
+version = "0.1.0"
+description = "Reusable model calibration workflows for LUME simulation models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "lightning>=2.5,<3",
+    "pyro-ppl>=1.9,<2",
+    "cheetah-accelerator",
+    "lume-cheetah",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+examples = [
+    "matplotlib",
+    "ipykernel",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lume_applications", "lume_applications.*"]
+exclude = ["lume_applications.tests", "lume_applications.tests.*"]
+namespaces = true
