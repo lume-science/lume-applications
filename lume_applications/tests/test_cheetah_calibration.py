@@ -175,7 +175,7 @@ def test_calibration_single_step(quadrupole_scan_dataset, model):
 		for strength, target in zip(dataset["quadrupole_k1"], dataset["images"]):
 			fitting_model.set({"Q1_k": strength})
 			final_losses.append(image_loss(fitting_model.get(["screen_image"])["screen_image"], target))
-	assert history[-1] == pytest.approx(torch.stack(final_losses).mean().item())
+	assert history[-1] == pytest.approx(torch.stack(final_losses).sum().item())
 	for name, value in model.state_dict().items():
 		torch.testing.assert_close(value, original_state[name], equal_nan=True)
 	for name, value in dataset.items():
@@ -289,7 +289,12 @@ def additive_model():
 
 
 @pytest.mark.parametrize("use_trainer", [False, True])
-def test_calibration_default_loss(additive_model, use_trainer):
+@pytest.mark.parametrize("loss_weights, expected_terms", [
+	(None, {"value": 8., "double": 32.}),
+	({"double": 0.25}, {"value": 8., "double": 8.}),
+	({"value": 0.}, {"value": 0., "double": 32.}),
+])
+def test_calibration_default_loss(additive_model, use_trainer, loss_weights, expected_terms):
 	inputs = {
 		"first": torch.tensor([1., 2.], requires_grad=True),
 		"second": torch.tensor([3., 4.], requires_grad=True),
@@ -298,26 +303,81 @@ def test_calibration_default_loss(additive_model, use_trainer):
 		"value": torch.tensor([6., 8.], requires_grad=True),
 		"double": torch.tensor([12., 16.], requires_grad=True),
 	}
-	optimizer = torch.optim.SGD([additive_model.offset], lr=0.1)
+	initial_loss = sum(expected_terms.values())
+	optimizer = torch.optim.SGD([additive_model.offset], lr=1. / initial_loss)
 	if use_trainer:
-		calibration = CalibrationModule(additive_model, inputs, targets, optimizer)
+		calibration = CalibrationModule(
+			additive_model, inputs, targets, optimizer, loss_weights=loss_weights,
+		)
+		total_loss, target_losses = calibration.evaluate_loss(calibration.inputs, calibration.targets)
+		assert total_loss.item() == pytest.approx(initial_loss)
+		assert {name: loss.item() for name, loss in target_losses.items()} == expected_terms
+		assert all(loss.requires_grad for loss in target_losses.values())
+		assert torch.autograd.grad(total_loss, additive_model.offset)[0].item() == pytest.approx(-initial_loss)
 		trainer = Trainer(
 			accelerator="cpu", devices=1, max_steps=2, max_epochs=-1,
 			logger=False, enable_checkpointing=False, enable_progress_bar=False,
 			enable_model_summary=False,
 		)
 		trainer.fit(calibration)
-		history = calibration.loss_history
+		history = calibration.loss_history.copy()
 		assert calibration.automatic_optimization
 		assert trainer.global_step == 2
 		assert "train_loss" in trainer.callback_metrics
+		for name, values in calibration.target_loss_history.items():
+			assert values == pytest.approx([
+				expected_terms[name] * factor for factor in (1., 0.25, 0.0625)
+			])
+			assert all(isinstance(value, float) for value in values)
+			assert trainer.callback_metrics[f"train_loss/{name}"].item() == pytest.approx(values[-2])
+		assert history == pytest.approx([
+			sum(contributions) for contributions in zip(*calibration.target_loss_history.values())
+		])
+		calibration.on_train_start()
+		assert calibration.loss_history == []
+		assert calibration.target_loss_history == {"value": [], "double": []}
 	else:
-		history = calibrate_model(additive_model, inputs, targets, optimizer, steps=2)
-	assert history == pytest.approx([10., 2.5, 0.625])
+		history = calibrate_model(
+			additive_model, inputs, targets, optimizer, steps=2, loss_weights=loss_weights,
+		)
+	assert history == pytest.approx([initial_loss * factor for factor in (1., 0.25, 0.0625)])
 	assert additive_model.offset.item() == pytest.approx(1.5)
 	assert additive_model.gain.item() == 1.
 	assert additive_model.gain.grad is None
 	assert all(value.grad is None for value in [*inputs.values(), *targets.values()])
+
+
+@pytest.mark.parametrize("weights, message", [
+	({"missing": 1.}, "unknown target"),
+	({"value": -1.}, "finite nonnegative"),
+	({"value": float("nan")}, "finite nonnegative"),
+	({"value": float("inf")}, "finite nonnegative"),
+	({"value": True}, "finite nonnegative"),
+	({"value": "1"}, "finite nonnegative"),
+	({"value": 0., "double": 0.}, "at least one"),
+])
+def test_calibration_invalid_loss_weights(additive_model, weights, message):
+	optimizer = torch.optim.SGD([additive_model.offset], lr=0.01)
+	with pytest.raises(ValueError, match=message):
+		CalibrationModule(
+			additive_model, {"first": torch.ones(1), "second": torch.ones(1)},
+			{"value": torch.zeros(1), "double": torch.zeros(1)}, optimizer,
+			loss_weights=weights,
+		)
+
+
+def test_calibration_copies_loss_weights(additive_model):
+	weights = {"double": 0.25}
+	calibration = CalibrationModule(
+		additive_model, {"first": torch.ones(1), "second": torch.ones(1)},
+		{"value": torch.zeros(1), "double": torch.zeros(1)},
+		torch.optim.SGD([additive_model.offset], lr=0.01), loss_weights=weights,
+	)
+	weights["double"] = 100.
+	total, terms = calibration.evaluate_loss(calibration.inputs, calibration.targets)
+	assert calibration.loss_weights == {"value": 1., "double": 0.25}
+	assert total.item() == pytest.approx(8.)
+	assert {name: term.item() for name, term in terms.items()} == {"value": 4., "double": 4.}
 
 
 @pytest.fixture

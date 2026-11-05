@@ -27,6 +27,23 @@ The `test` extra adds pytest; `examples` adds matplotlib and ipykernel. Open the
 example notebook in a notebook frontend such as VS Code and select the Python
 environment where the package is installed.
 
+## Loss Tracking
+
+`CalibrationModule` sums the scalar losses across scan points for each target,
+then adds those target contributions to obtain the total. The supplied `loss_fn`
+still controls reduction within each output; the default MSE averages image pixels.
+
+- `evaluate_loss(inputs, targets)` returns `(total_loss, target_losses)`, with
+	differentiable tensors keyed by target name in `target_losses`.
+- `loss_history` records totals; `target_loss_history[name]` records each target's
+	contribution at the same steps. Both include a fresh final evaluation.
+- Lightning logs `train_loss` and `train_loss/<target>` during training.
+
+`calibrate_model` continues to return only the total-loss history. Use
+`CalibrationModule` directly to access per-target histories. Summing instead of
+averaging increases loss and gradient scales with scan size and target count;
+existing learning rates may need adjustment.
+
 ## Tests
 
 After installing the `test` extra, run from the repository root:
