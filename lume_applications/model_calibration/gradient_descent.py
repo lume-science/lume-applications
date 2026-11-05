@@ -1,6 +1,4 @@
 from collections.abc import Callable, Mapping
-import math
-from numbers import Real
 
 import torch
 from lightning.pytorch import LightningModule, Trainer
@@ -9,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from .utils import (
 	clone_tensor_mapping,
+	validate_loss_weights,
 	validate_positive_integer,
 	validate_prediction_shape,
 	validate_training_data,
@@ -27,26 +26,16 @@ def get_trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]
 
 
 class CalibrationModule(LightningModule):
-	"""Lightning training for a differentiable set/get model and a fixed scan.
+	"""PyTorch Lightning training for a lume-style model 
+	(lume-torch, lume-cheetah) with a differentiable set(dict)/get(dict) interface.
+	Trains any PyTorch parameters registered with the optimizer.
 
-	Input and target keys are model variable names; tensors share a leading
-	sample dimension. Each training batch contains the entire scan. Scalar
-	losses are summed over samples for each target, then summed over targets,
-	with exact matching prediction/target shapes. Reduction within each output
-	is controlled by loss_fn (MSE by default). Data are copied and detached.
-	loss_weights optionally maps target names to finite nonnegative multipliers.
-	Omitted weights default to 1; at least one must be positive. Returned terms,
-	histories, and logged target losses include these weights without normalization.
+    Training inputs and targets are provided as mappings from lume-model variable 
+	names to tensors. By default each training batch contains the entire scan. Scalar
+	losses are summed over samples for each target, then combined according to 
+	`loss_weights` (omitted weights default to 1). Reduction within each output 
+	is controlled by loss_fn (MSE by default).
 
-	Register parameters before creating the supplied optimizer. Scanned inputs
-	must not overwrite fitted parameters. The wrapped model is mutated in place
-	and never reset. Lightning owns backward, gradient clearing and updates.
-	Use a single-device Trainer with accumulate_grad_batches=1 for one update
-	per full scan. loss_history contains one scalar per training batch followed
-	by a fresh full-scan loss at the end of fit. target_loss_history maps target
-	names to aligned contribution histories. Lightning logs train_loss and
-	train_loss/<target>. Increasing scan size or target count increases the loss
-	and gradient scale; optimizer learning rates may need adjustment.
 	"""
 
 	def __init__(
@@ -59,20 +48,31 @@ class CalibrationModule(LightningModule):
 		loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = mse_loss,
 		loss_weights: Mapping[str, float] | None = None,
 	):
+		"""
+        Initialize the calibration module with the model, inputs, targets, optimizer,
+        loss function, and optional loss weights.
+		
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The differentiable model to be calibrated.
+        inputs : Mapping[str, torch.Tensor]
+            The input tensors for the scan.
+        targets : Mapping[str, torch.Tensor]
+            The target tensors for the scan.
+        optimizer : torch.optim.Optimizer
+            The optimizer for updating model parameters.
+        loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor], optional
+            The loss function to use (default is mse_loss) for each target.
+        loss_weights : Mapping[str, float] | None, optional
+            Weights for each target in the loss computation (default is None).
+        """
+        
 		super().__init__()
+		
 		validate_training_data(inputs, targets)
-		weights = {} if loss_weights is None else dict(loss_weights)
-		if weights.keys() - targets.keys():
-			raise ValueError("loss_weights contains unknown target names")
-		if any(
-			isinstance(weight, bool) or not isinstance(weight, Real)
-			or not math.isfinite(weight) or weight < 0
-			for weight in weights.values()
-		):
-			raise ValueError("loss_weights must be finite nonnegative numbers")
-		self.loss_weights = {name: float(weights.get(name, 1.0)) for name in targets}
-		if not any(self.loss_weights.values()):
-			raise ValueError("at least one loss weight must be positive")
+		self.loss_weights = validate_loss_weights(loss_weights, targets)
+		
 		parameters = [
 			parameter for group in optimizer.param_groups for parameter in group["params"]
 		]
@@ -87,13 +87,32 @@ class CalibrationModule(LightningModule):
 		self.target_loss_history: dict[str, list[float]] = {name: [] for name in targets}
 
 	def train_dataloader(self) -> DataLoader:
+		"""Return a DataLoader for the training data."""
 		return DataLoader([(self.inputs, self.targets)], batch_size=None, num_workers=0)
 
 	def configure_optimizers(self) -> torch.optim.Optimizer:
+		"""Return the optimizer for training."""
 		return self._optimizer
 
 	def evaluate_loss(self, inputs, targets) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-		"""Return the total loss and differentiable weighted per-target scan sums."""
+		"""
+		Return the total loss and differentiable weighted per-target scan sums.
+		
+		Parameters
+		----------
+		inputs : Mapping[str, torch.Tensor]
+			The input tensors for the scan.
+		targets : Mapping[str, torch.Tensor]
+			The target tensors for the scan.
+
+		Returns
+		-------
+		total_loss : torch.Tensor
+			The total weighted loss for the scan.
+		target_losses : dict[str, torch.Tensor]
+			The weighted per-target losses for the scan.
+		
+		"""
 		losses = {name: [] for name in targets}
 		for sample_index in range(next(iter(inputs.values())).shape[0]):
 			self.model.set(
@@ -120,6 +139,23 @@ class CalibrationModule(LightningModule):
 		return total_loss, target_losses
 
 	def training_step(self, batch, batch_idx):
+		"""
+		Perform a single training step.
+
+        Parameters
+        ----------
+        batch : tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]
+            A tuple containing the input and target tensors for the batch.
+        batch_idx : int
+            The index of the batch.
+
+        Returns
+        -------
+        dict[str, Any]
+            A dictionary containing the total loss and per-target losses.
+
+        """
+        
 		inputs, targets = batch
 		loss, target_losses = self.evaluate_loss(inputs, targets)
 		if not loss.requires_grad:
@@ -135,6 +171,9 @@ class CalibrationModule(LightningModule):
 		return {"loss": loss, "target_losses": target_losses}
 
 	def on_before_optimizer_step(self, optimizer):
+		"""
+		Called before the optimizer step to validate parameter gradients.
+		"""
 		for group in optimizer.param_groups:
 			for parameter in group["params"]:
 				if parameter.grad is None:
@@ -143,11 +182,17 @@ class CalibrationModule(LightningModule):
 					raise ValueError("parameter gradients must be finite")
 
 	def on_train_start(self):
+		"""
+		Called at the start of training to clear loss histories.
+		"""
 		self.loss_history.clear()
 		for history in self.target_loss_history.values():
 			history.clear()
 
 	def on_train_end(self):
+		"""
+		Called at the end of training to perform a final evaluation and update loss histories.
+		"""
 		inputs, targets = self.transfer_batch_to_device(
 			(self.inputs, self.targets), self.device, 0
 		)
@@ -168,11 +213,30 @@ def calibrate_model(
 	loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = mse_loss,
 	loss_weights: Mapping[str, float] | None = None,
 ) -> list[float]:
-	"""Fit in place with a single-CPU Lightning Trainer and full-scan updates.
+	"""
+	Fit in place a lume-style differentiable model with a single-CPU 
+	Lightning Trainer and full-scan updates.
 
 	Returns steps + 1 weighted summed losses, including a fresh final evaluation. Use
 	CalibrationModule with your own Trainer for per-target histories, device
 	configuration, or callbacks.
+	
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model to be calibrated.
+    inputs : Mapping[str, torch.Tensor]
+        The input tensors for the calibration.
+    targets : Mapping[str, torch.Tensor]
+        The target tensors for the calibration.
+    optimizer : torch.optim.Optimizer
+        The optimizer used for the calibration.
+    steps : int
+        The number of optimization steps to perform.
+    loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor], optional
+        The loss function to use for calibration (default is mse_loss).
+    loss_weights : Mapping[str, float] | None, optional
+        The weights for each target loss (default is None).
 	"""
 	validate_positive_integer(steps, "steps")
 	calibration = CalibrationModule(
