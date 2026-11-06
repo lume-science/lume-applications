@@ -1,4 +1,6 @@
 from collections.abc import Iterable, Mapping
+import math
+from numbers import Real
 
 import torch
 
@@ -44,6 +46,26 @@ def validate_training_data(
 	if require_finite:
 		validate_finite_tensors(data, name="inputs and targets")
 	return count
+
+
+def validate_loss_weights(
+	loss_weights: Mapping[str, float] | None,
+	targets: Mapping[str, torch.Tensor],
+) -> dict[str, float]:
+	"""Validate target weights and return a copy with omitted weights set to one."""
+	weights = {} if loss_weights is None else dict(loss_weights)
+	if weights.keys() - targets.keys():
+		raise ValueError("loss_weights contains unknown target names")
+	if any(
+		isinstance(weight, bool) or not isinstance(weight, Real)
+		or not math.isfinite(weight) or weight < 0
+		for weight in weights.values()
+	):
+		raise ValueError("loss_weights must be finite nonnegative numbers")
+	validated_weights = {name: float(weights.get(name, 1.0)) for name in targets}
+	if not any(validated_weights.values()):
+		raise ValueError("at least one loss weight must be positive")
+	return validated_weights
 
 
 def validate_prediction_shape(

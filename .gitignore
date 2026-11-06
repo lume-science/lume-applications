@@ -229,3 +229,6 @@ __marimo__/
 *.pyc
 *.pyo
 *.pyd
+
+# vscode
+.vscode/
