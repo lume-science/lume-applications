@@ -21,15 +21,16 @@ def generalized_taylor(model, input_names: Dict[str, torch.Tensor], output_names
 
 class GenerizalizedTaylorPrior(torch.nn.Module):
 
-    def __init__(self, jacobian, hessian, z0):
+    def __init__(self, jacobian, hessian, z0, f0):
         super().__init__()
         self.register_buffer("J", jacobian.to(torch.float64))
         self.register_buffer("H", hessian.to(torch.float64))
         self.register_buffer("z0", z0.to(torch.float64))
+        self.register_buffer("f0", f0.to(torch.float64))
     def forward(self, x):
         # x: (..., z) input tensor
         delta = x - self.z0
         linear_term = delta @ self.J.T
         quadratic_term = 0.5 * torch.einsum('...i,ij,...j->...', delta, self.H, delta)
-        return linear_term + quadratic_term
+        return self.f0 + linear_term + quadratic_term
 
