@@ -15,11 +15,10 @@ def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: l
         This model is unmodified by any calls to generalized_taylor
         Serves as the reference model for the Taylor expansion.
     input_names : list of str
-        Inputs variables names gather from the model to construct x to differentiate with respect to. Their order fixes the order of the
+        Input variables names gather from the model to construct x to differentiate with respect to. Their order fixes the order of the
         entries of x0, J and H.
     output_names : list of str
         Outputs read from the model and passed to g as a dict keyed by name.
-        Their order fixes the order of the entries of the returned y0.
     g : callable
         Maps y: dict[str, torch.Tensor] to the scalar f being approximated, e.g.
         g(y) = y["sigma_x"]**2 + y["sigma_y"]**2, Must return a scalar,
@@ -31,15 +30,14 @@ def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: l
 
     Returns
     -------
+    x0 : torch.Tensor, shape (n,)
+        Expansion point.
+    f0 : torch.Tensor, scalar
+        f at x0, i.e. g(y0) where y0 are the model outputs at x0.
     J : torch.Tensor, shape (n,)
         Gradient of f at x0.
     H : torch.Tensor, shape (n, n)
         Hessian of f at x0.
-    x0 : torch.Tensor, shape (n,)
-        Expansion point.
-    y0 : dict[str, torch.Tensor]
-        Model outputs at x0, keyed by output name, before g. Pass g(y0) to the
-        prior as f0.
     """
     model = deepcopy(model)
 
@@ -66,7 +64,7 @@ def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: l
 
     return x0, f0, J.detach(), H.detach()
 
-class GenerizalizedTaylorPrior(torch.nn.Module):
+class GeneralizedTaylorPrior(torch.nn.Module):
     """GP prior mean from a second-order Taylor expansion of f about z0:
 
         f_prior(x) = f0 + J (x - z0) + 1/2 (x - z0)^T H (x - z0)
