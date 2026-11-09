@@ -22,6 +22,9 @@ def generalized_taylor(model: LUMEModel, input_names: Dict[str, torch.Tensor], o
         Maps y: dict[str, torch.Tensor] to the scalar f being approximated, e.g.
         g(y) = y["sigma_x"]**2 + y["sigma_y"]**2, Must return a scalar,
         since H is the Hessian of a scalar function.
+    x0 : dict[str, torch.Tensor], optional
+        Expansion point for the Taylor series. If not None, the model is set to these settings and used as x0.
+        If None, the model's current inputs are used.
 
     Returns
     -------
