@@ -1,4 +1,4 @@
-"""Check generalized_taylor and GenerizalizedTaylorPrior against hand-derived derivatives.
+"""Check generalized_taylor and GeneralizedTaylorPrior against hand-derived derivatives.
 
 Each case pairs a toy model y = F(x) with a scalar g(y) whose gradient and Hessian of
 f(x) = g(F(x)) are known in closed form, so the autograd result is compared to an analytic one.
@@ -11,7 +11,7 @@ import torch
 from lume.model import LUMEModel
 from lume_torch.variables import TorchScalarVariable
 
-from lume_applications.prior_mean import GenerizalizedTaylorPrior, generalized_taylor
+from lume_applications.online_control.prior_mean import GeneralizedTaylorPrior, generalized_taylor
 
 DTYPE = torch.float64
 
@@ -94,11 +94,19 @@ def _build(case):
 	return AnalyticModel(fn, X0, n_outputs), fn, g, grad, hess
 
 
+def _taylor(model, g):
+	"""generalized_taylor passes g a dict of outputs; stack it so the tensor-valued g's above apply."""
+	return generalized_taylor(
+		model, model.input_names, model.output_names,
+		lambda y: g(torch.stack([y[k] for k in model.output_names])),
+	)
+
+
 @pytest.mark.parametrize("case", CASES)
 def test_jacobian_and_hessian_match_analytic(case):
 	''' Test that the Jacobian and Hessian computed by generalized_taylor match the analytic expressions. '''
 	model, _, g, grad, hess = _build(case)
-	J, H, _, _ = generalized_taylor(model, model.input_names, model.output_names, g)
+	_, _, J, H = _taylor(model, g)
 	torch.testing.assert_close(J, grad(X0))
 	torch.testing.assert_close(H, hess(X0))
 
@@ -107,10 +115,10 @@ def test_jacobian_and_hessian_match_analytic(case):
 def test_returns_expansion_point_and_restores_model(case):
 	''' Test that generalized_taylor returns the correct expansion point and restores the model state. '''
 	model, fn, g, _, _ = _build(case)
-	J, H, x0, y0 = generalized_taylor(model, model.input_names, model.output_names, g)
+	x0, f0, J, H = _taylor(model, g)
 
 	torch.testing.assert_close(x0, X0)
-	torch.testing.assert_close(y0, fn(X0))  # raw model outputs, not g(y0)
+	torch.testing.assert_close(f0, g(fn(X0)))
 
 	# the model is left at x0 and carries no autograd graph
 	state = model.get(model.input_names + model.output_names)
@@ -123,16 +131,16 @@ def test_returns_expansion_point_and_restores_model(case):
 def test_prior_matches_f_at_expansion_point(case):
 	''' Test that the prior matches the function value at the expansion point. '''
 	model, fn, g, _, _ = _build(case)
-	J, H, x0, y0 = generalized_taylor(model, model.input_names, model.output_names, g)
-	prior = GenerizalizedTaylorPrior(J, H, x0, g(y0))
+	x0, f0, J, H = _taylor(model, g)
+	prior = GeneralizedTaylorPrior(x0, f0, J, H)
 	torch.testing.assert_close(prior(X0.unsqueeze(0)), g(fn(X0)).reshape(1))
 
 
 def test_prior_is_exact_for_quadratic_f():
 	''' Test that the prior is exact for a quadratic function. '''
 	model, fn, g, _, _ = _build("sum_of_squares")
-	J, H, x0, y0 = generalized_taylor(model, model.input_names, model.output_names, g)
-	prior = GenerizalizedTaylorPrior(J, H, x0, g(y0))
+	x0, f0, J, H = _taylor(model, g)
+	prior = GeneralizedTaylorPrior(x0, f0, J, H)
 
 	x = X0 + torch.randn(20, 3, dtype=DTYPE, generator=torch.Generator().manual_seed(0))
 	expected = torch.stack([g(fn(xi)) for xi in x])
@@ -144,8 +152,8 @@ def test_prior_error_is_third_order(case):
 	''' Test that the prior error scales as the third power of the step size. '''
 	''' Halving the step should shrink |f - prior| by ~8x; a wrong H (e.g. a missing 1/2) gives ~4x. '''
 	model, fn, g, _, _ = _build(case)
-	J, H, x0, y0 = generalized_taylor(model, model.input_names, model.output_names, g)
-	prior = GenerizalizedTaylorPrior(J, H, x0, g(y0))
+	x0, f0, J, H = _taylor(model, g)
+	prior = GeneralizedTaylorPrior(x0, f0, J, H)
 
 	direction = torch.tensor([1.0, 0.5, -0.8], dtype=DTYPE)
 	steps = [0.1, 0.05, 0.025]
@@ -162,8 +170,8 @@ def test_prior_error_is_third_order(case):
 def test_prior_batch_shapes(batch_shape):
 	''' Test that the prior correctly handles batched inputs and preserves batch shapes. '''
 	model, _, g, _, _ = _build("logsumexp")
-	J, H, x0, y0 = generalized_taylor(model, model.input_names, model.output_names, g)
-	prior = GenerizalizedTaylorPrior(J, H, x0, g(y0))
+	x0, f0, J, H = _taylor(model, g)
+	prior = GeneralizedTaylorPrior(x0, f0, J, H)
 
 	x = X0 + 0.1 * torch.randn(*batch_shape, 3, dtype=DTYPE)
 	out = prior(x)
