@@ -1,8 +1,16 @@
 import torch
-from typing import Callable, Dict,Optional
+from typing import Callable, Dict, Optional
 from lume.model import LUMEModel
-from copy import deepcopy 
-def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: list[str], g: Callable[[Dict[str,torch.Tensor]], torch.Tensor], x0: Optional[Dict[str,torch.Tensor]]=None):
+from copy import deepcopy
+
+
+def generalized_taylor(
+    model: LUMEModel,
+    input_names: list[str],
+    output_names: list[str],
+    g: Callable[[Dict[str, torch.Tensor]], torch.Tensor],
+    x0: Optional[Dict[str, torch.Tensor]] = None,
+):
     """Compute the gradient and Hessian of the scalar-valued function f(x) = g(model(x)) at a specified expansion point.
     The model must preserve the PyTorch computation graph between the input tensors passed to model.set()
     and the output tensors returned by model.get(). The model is deepcopy'd
@@ -48,10 +56,7 @@ def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: l
         x0 = torch.stack([x0[k] for k in input_names]).detach()
         model.set({k: x0[i] for i, k in enumerate(input_names)})
 
-    y0 = {
-        k: v.detach()
-        for k, v in model.get(output_names).items()
-    }
+    y0 = {k: v.detach() for k, v in model.get(output_names).items()}
 
     def forward(x):
         model.set({k: x[i] for i, k in enumerate(input_names)})
@@ -63,6 +68,7 @@ def generalized_taylor(model: LUMEModel, input_names: list[str], output_names: l
     f0 = g(y0).detach()
 
     return x0, f0, J.detach(), H.detach()
+
 
 class GeneralizedTaylorPrior(torch.nn.Module):
     """GP prior mean from a second-order Taylor expansion of f about z0:
@@ -90,23 +96,24 @@ class GeneralizedTaylorPrior(torch.nn.Module):
         z0: torch.Tensor,
         f0: torch.Tensor,
         jacobian: torch.Tensor,
-        hessian: Optional[torch.Tensor] = None
+        hessian: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.register_buffer("z0", z0.to(torch.float64))
         self.register_buffer("f0", f0.to(torch.float64))
         self.register_buffer("J", jacobian.to(torch.float64))
         self.register_buffer(
-            "H",
-            None if hessian is None else hessian.to(torch.float64)
-)
+            "H", None if hessian is None else hessian.to(torch.float64)
+        )
+
     def forward(self, x):
         """x: (..., n) inputs, ordered as input_names -> (...,) prior mean f_prior(x)."""
         delta = x - self.z0
         linear_term = delta @ self.J.T
         if self.H is not None:
-            quadratic_term = 0.5 * torch.einsum('...i,ij,...j->...', delta, self.H, delta)
+            quadratic_term = 0.5 * torch.einsum(
+                "...i,ij,...j->...", delta, self.H, delta
+            )
         else:
             quadratic_term = 0.0
         return self.f0 + linear_term + quadratic_term
-
