@@ -20,6 +20,11 @@ dependencies = [
 test = [
     "pytest",
 ]
+dev = [
+    "pytest",
+    "pre-commit",
+    "ruff",
+]
 examples = [
     "matplotlib",
     "ipykernel",
