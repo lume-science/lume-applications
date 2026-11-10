@@ -10,7 +10,7 @@ LUMEcheetah model; no EPICS server is required.
 
 ## Installation
 
-Requires Python 3.10 or newer. From the repository root:
+Requires Python 3.11 or newer. From the repository root:
 
 ```bash
 python -m pip install .
