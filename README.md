@@ -27,7 +27,7 @@ The `test` extra adds pytest; `examples` adds matplotlib and ipykernel. Open the
 example notebook in a notebook frontend such as VS Code and select the Python
 environment where the package is installed.
 
-## Loss Tracking
+## Model Calibration
 
 `CalibrationModule` sums the scalar losses across scan points for each target,
 then adds those target contributions to obtain the total. The supplied `loss_fn`
