@@ -7,7 +7,7 @@ name = "lume-applications"
 version = "0.1.0"
 description = "Reusable model calibration workflows for LUME simulation models"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0",
     "lightning>=2.5",
