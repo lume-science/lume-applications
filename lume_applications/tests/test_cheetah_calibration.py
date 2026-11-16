@@ -14,6 +14,8 @@ from lume_cheetah.simulator import CheetahSimulator
 
 from lume_applications.model_calibration import (
     CalibrationModule,
+    TorchAffineTransform,
+    TorchModelWithTransforms,
     calibrate_model,
     get_trainable_parameters,
 )
@@ -191,6 +193,51 @@ def test_calibration_single_step(quadrupole_scan_dataset, model):
     torch.testing.assert_close(fitting_beam, initial_beam)
     for value, original in zip(fixed_geometry, original_geometry):
         torch.testing.assert_close(value, original)
+
+
+def test_transform_and_misalignment_calibration(model):
+    model.simulator.segment.SCR1.pixel_size = torch.tensor([2e-4, 2e-4])
+    reference = deepcopy(model)
+    reference.simulator.segment.Q1.misalignment = torch.tensor([1e-3, -2e-3])
+    # Cheetah's current complex-sqrt backward returns NaN at exactly k1=0.
+    strengths = torch.linspace(-2.0, 2.0, 8)
+    images = []
+    for strength in strengths:
+        reference.set({"Q1_k": 1.1 * strength + 0.15})
+        images.append(reference.get(["screen_image"])["screen_image"].detach().clone())
+    images = torch.stack(images)
+    model.simulator.segment.Q1.misalignment = torch.nn.Parameter(torch.zeros(2))
+    wrapper = TorchModelWithTransforms(model, {"Q1_k": TorchAffineTransform()})
+    transform = wrapper.transforms["Q1_k"]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [model.simulator.segment.Q1.misalignment], "lr": 1e-4},
+            {"params": wrapper.transform_parameters, "lr": 1e-2},
+        ]
+    )
+    image_scale = images.abs().max()
+    history = calibrate_model(
+        wrapper,
+        {"Q1_k": strengths},
+        {"screen_image": images},
+        optimizer,
+        steps=150,
+        loss_fn=lambda prediction, target: torch.nn.functional.mse_loss(
+            prediction / image_scale, target / image_scale
+        ),
+    )
+    assert history[-1] < history[0] * 0.1
+    assert transform.scale.item() != 1.0
+    assert transform.offset.item() != 0.0
+    for parameter in get_trainable_parameters(wrapper):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert (parameter.grad != 0).all()
+    strength = torch.tensor(0.5, requires_grad=True)
+    wrapper.set({"Q1_k": strength})
+    torch.testing.assert_close(model.simulator.segment.Q1.k1, transform(strength))
+    wrapper.get(["screen_image"])["screen_image"].square().sum().backward()
+    assert strength.grad is not None and torch.isfinite(strength.grad)
 
 
 def test_svi_misalignment(quadrupole_scan_dataset, model):
