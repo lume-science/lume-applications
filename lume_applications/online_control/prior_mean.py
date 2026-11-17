@@ -69,19 +69,21 @@ def generalized_taylor(
 
     return x0, f0, J.detach(), H.detach()
 
-class GeneralizeLUMEPrior(torch.nn.Module):
+class GeneralizedLUMEPrior(torch.nn.Module):
     def __init__(self,
                  model: LUMEModel,
                  input_names: list[str],
+                 output_names: list[str],
                  g: Callable[[Dict[str, torch.Tensor]], torch.Tensor]):
         super().__init__()
         self.model = deepcopy(model)
         self.input_names = input_names
+        self.output_names = output_names
         self.g = g
 
     def forward(self, x):
-        self.model.set({k: x[i] for i, k in enumerate(self.input_names)})
-        y = self.model.supported_variables
+        self.model.set({k: x[...,i] for i, k in enumerate(self.input_names)})
+        y = self.model.get(self.output_names)
         return self.g(y)
 
     

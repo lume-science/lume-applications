@@ -1,3 +1,3 @@
-from .prior_mean import generalized_taylor, GeneralizedTaylorPrior, GeneralizeLUMEPrior
+from .prior_mean import generalized_taylor, GeneralizedTaylorPrior, GeneralizedLUMEPrior
 
-__all__ = ["generalized_taylor", "GeneralizedTaylorPrior", "GeneralizeLUMEPrior"]
+__all__ = ["generalized_taylor", "GeneralizedTaylorPrior", "GeneralizedLUMEPrior"]
