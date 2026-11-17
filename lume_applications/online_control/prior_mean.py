@@ -69,7 +69,22 @@ def generalized_taylor(
 
     return x0, f0, J.detach(), H.detach()
 
+class GeneralizeLUMEPrior(torch.nn.Module):
+    def __init__(self,
+                 model: LUMEModel,
+                 input_names: list[str],
+                 g: Callable[[Dict[str, torch.Tensor]], torch.Tensor]):
+        super().__init__()
+        self.model = deepcopy(model)
+        self.input_names = input_names
+        self.g = g
 
+    def forward(self, x):
+        self.model.set({k: x[i] for i, k in enumerate(self.input_names)})
+        y = self.model.supported_variables
+        return self.g(y)
+
+    
 class GeneralizedTaylorPrior(torch.nn.Module):
     """GP prior mean from a second-order Taylor expansion of f about z0:
 
