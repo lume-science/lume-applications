@@ -1,4 +1,5 @@
 from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -240,6 +241,50 @@ def test_transform_and_misalignment_calibration(model):
     assert strength.grad is not None and torch.isfinite(strength.grad)
 
 
+def test_transverse_input_beam_calibration(model):
+    model.double()
+    source = model.enable_trainable_input_beam()
+    reference = deepcopy(source)
+    with torch.no_grad():
+        reference.log_beta_x.add_(0.3)
+        reference.log_beta_y.sub_(0.25)
+        reference.alpha_x.add_(0.25)
+        reference.alpha_y.sub_(0.2)
+        reference.log_emittance_x.add_(0.4)
+        reference.log_emittance_y.sub_(0.3)
+    strengths = torch.linspace(-1.5, 1.5, 6, dtype=torch.float64)
+    names = ["beam:SCR1:sigma_x", "beam:SCR1:sigma_y"]
+    targets = {name: [] for name in names}
+    with torch.no_grad():
+        for strength in strengths:
+            model.simulator.segment.Q1.k1 = strength
+            beam = model.simulator.segment.track(reference())
+            for plane, name in zip(("x", "y"), names, strict=True):
+                targets[name].append(getattr(beam, f"sigma_{plane}").clone())
+    targets = {name: torch.stack(values) for name, values in targets.items()}
+    optimizer = torch.optim.Adam(get_trainable_parameters(model), lr=0.03)
+    history = calibrate_model(
+        model,
+        {"Q1_k": strengths},
+        targets,
+        optimizer,
+        steps=500,
+        loss_fn=lambda prediction, target: torch.nn.functional.mse_loss(
+            prediction * 1e3, target * 1e3
+        ),
+    )
+    assert history[-1] < history[0] * 1e-4
+    for plane in ("x", "y"):
+        for attribute in ("beta", "alpha", "emittance"):
+            name = f"{attribute}_{plane}"
+            torch.testing.assert_close(
+                getattr(source, name), getattr(reference, name), rtol=0.02, atol=1e-9
+            )
+    assert len(get_trainable_parameters(model)) == 6
+    for parameter in get_trainable_parameters(model):
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
 def test_svi_misalignment(quadrupole_scan_dataset, model):
     import pyro
     import pyro.distributions as dist
@@ -397,6 +442,51 @@ def additive_model():
             return {name: outputs[name] for name in names}
 
     return AdditiveModel()
+
+
+@pytest.mark.parametrize("samples", [1, 3])
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+def test_calibration_batches_set_get_without_changing_loss(
+    additive_model, samples, reduction
+):
+    inputs = {
+        "first": torch.arange(samples * 2, dtype=torch.float32).reshape(samples, 2),
+        "second": torch.ones(samples, 2),
+    }
+    targets = {"value": torch.zeros(samples, 2), "double": torch.ones(samples, 2)}
+
+    def loss_fn(prediction, target):
+        return torch.nn.functional.mse_loss(prediction, target, reduction=reduction)
+
+    calibration = CalibrationModule(
+        additive_model,
+        inputs,
+        targets,
+        torch.optim.SGD([additive_model.offset], lr=0.01),
+        loss_fn=loss_fn,
+        loss_weights={"double": 0.25},
+    )
+    expected_prediction = inputs["first"] + inputs["second"] + additive_model.offset
+    expected = sum(
+        loss_fn(prediction, target) + 0.25 * loss_fn(2 * prediction, double_target)
+        for prediction, target, double_target in zip(
+            expected_prediction, targets["value"], targets["double"], strict=True
+        )
+    )
+    expected_gradient = torch.autograd.grad(expected, additive_model.offset)[0]
+    with (
+        patch.object(additive_model, "set", wraps=additive_model.set) as set_values,
+        patch.object(additive_model, "get", wraps=additive_model.get) as get_values,
+    ):
+        total, _ = calibration.evaluate_loss(calibration.inputs, calibration.targets)
+    set_values.assert_called_once()
+    get_values.assert_called_once_with(["value", "double"])
+    for name in inputs:
+        torch.testing.assert_close(set_values.call_args.args[0][name], inputs[name])
+    torch.testing.assert_close(total, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(total, additive_model.offset)[0], expected_gradient
+    )
 
 
 @pytest.mark.parametrize("use_trainer", [False, True])

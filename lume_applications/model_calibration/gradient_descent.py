@@ -31,7 +31,8 @@ class CalibrationModule(LightningModule):
         Trains any PyTorch parameters registered with the optimizer.
 
     Training inputs and targets are provided as mappings from lume-model variable
-        names to tensors. By default each training batch contains the entire scan. Scalar
+        names to tensors. Each model set/get call evaluates the entire scan as a batch.
+        Models must preserve the leading sample dimension in their outputs. Scalar
         losses are summed over samples for each target, then combined according to
         `loss_weights` (omitted weights default to 1). Reduction within each output
         is controlled by loss_fn (MSE by default).
@@ -121,26 +122,25 @@ class CalibrationModule(LightningModule):
                 The weighted per-target losses for the scan.
 
         """
-        losses = {name: [] for name in targets}
-        for sample_index in range(next(iter(inputs.values())).shape[0]):
-            self.model.set(
-                {name: values[sample_index].clone() for name, values in inputs.items()}
-            )
-            predictions = self.model.get(list(targets))
-            for name, values in targets.items():
-                prediction = predictions[name]
-                target = values[sample_index]
-                validate_prediction_shape(prediction, target, name)
-                loss = self.loss_fn(prediction, target)
+        self.model.set({name: values.clone() for name, values in inputs.items()})
+        predictions = self.model.get(list(targets))
+        target_losses = {}
+        for name, values in targets.items():
+            prediction = predictions[name]
+            validate_prediction_shape(prediction, values, name)
+            losses = []
+            for prediction_sample, target_sample in zip(
+                prediction, values, strict=True
+            ):
+                # Preserve custom per-sample reductions while batching the simulation.
+                loss = self.loss_fn(prediction_sample, target_sample)
                 if not isinstance(loss, torch.Tensor) or loss.ndim != 0:
                     raise ValueError("loss_fn must return a scalar tensor")
-                if not torch.isfinite(loss):
-                    raise ValueError("loss must be finite")
-                losses[name].append(loss)
-        target_losses = {
-            name: self.loss_weights[name] * torch.stack(values).sum()
-            for name, values in losses.items()
-        }
+                losses.append(loss)
+            sample_losses = torch.stack(losses)
+            if not torch.isfinite(sample_losses).all():
+                raise ValueError("loss must be finite")
+            target_losses[name] = self.loss_weights[name] * sample_losses.sum()
         total_loss = torch.stack(list(target_losses.values())).sum()
         if not torch.isfinite(total_loss):
             raise ValueError("loss must be finite")
@@ -225,12 +225,13 @@ def calibrate_model(
     loss_weights: Mapping[str, float] | None = None,
 ) -> list[float]:
     """
-        Fit in place a lume-style differentiable model with a single-CPU
-        Lightning Trainer and full-scan updates.
+        Fit in place a lume-style differentiable model with a single-device
+        Lightning Trainer and batched full-scan updates.
 
         Returns steps + 1 weighted summed losses, including a fresh final evaluation. Use
         CalibrationModule with your own Trainer for per-target histories, device
-        configuration, or callbacks.
+        configuration, or callbacks. Models must accept batched inputs and return
+        matching leading sample dimensions, including for single-sample scans.
 
     Parameters
     ----------
@@ -259,13 +260,12 @@ def calibrate_model(
         loss_weights=loss_weights,
     )
     trainer = Trainer(
-        accelerator="cpu",
         devices=1,
         max_steps=steps,
         max_epochs=-1,
         logger=False,
         enable_checkpointing=False,
-        enable_progress_bar=False,
+        enable_progress_bar=True,
         enable_model_summary=False,
     )
     trainer.fit(calibration)
