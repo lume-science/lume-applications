@@ -1,8 +1,19 @@
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 import math
 from numbers import Real
+from typing import Any, Protocol, runtime_checkable
 
 import torch
+from lume.model import LUMEModel
+
+
+@runtime_checkable
+class BidirectionalTransform(Protocol):
+    """Map external values to model values and back using BoTorch-style names."""
+
+    def transform(self, value: Any) -> Any: ...
+
+    def untransform(self, value: Any) -> Any: ...
 
 
 def validate_positive_integer(value: int, name: str) -> None:
@@ -95,3 +106,83 @@ def clone_tensor_mapping(
         name: (value if limit is None else value[:limit]).detach().clone()
         for name, value in values.items()
     }
+
+
+def validate_affine_parameters(scale: float, offset: float) -> None:
+    """Require finite scalar affine coefficients and an invertible scale."""
+    if not isinstance(scale, Real) or not isinstance(offset, Real):
+        raise TypeError("scale and offset must be real scalars")
+    if not math.isfinite(scale) or not math.isfinite(offset):
+        raise ValueError("scale and offset must be finite scalars")
+    if scale == 0:
+        raise ValueError("scale must be nonzero")
+
+
+def validate_transform_parameters(values: torch.Tensor) -> None:
+    """Require finite Torch affine parameters and a nonzero scale."""
+    if not values.is_floating_point():
+        raise TypeError("transform parameters must have a floating-point dtype")
+    if values.shape != (2,) or not torch.isfinite(values).all():
+        raise ValueError("scale and offset must be finite scalars")
+    if values[0] == 0:
+        raise ValueError("scale must be nonzero")
+
+
+def validate_transform_names(model: LUMEModel, names: Sequence[str]) -> None:
+    """Require transform names to identify supported inputs or outputs."""
+    supported = model.supported_variables
+    for name in names:
+        if name not in supported:
+            raise ValueError(f"unknown transform variable: {name!r}")
+
+
+def validate_bidirectional_transform(
+    transform: object, name: str
+) -> BidirectionalTransform:
+    """Require an instance with callable transform and untransform methods."""
+    if (
+        isinstance(transform, type)
+        or not isinstance(transform, BidirectionalTransform)
+        or not callable(transform.transform)
+        or not callable(transform.untransform)
+    ):
+        raise TypeError(
+            f"transform for {name!r} must be an instance with callable "
+            "transform and untransform methods"
+        )
+    return transform
+
+
+def validate_model_transforms(
+    model: LUMEModel,
+    transforms: Mapping[str, BidirectionalTransform],
+) -> None:
+    """Validate wrapper transforms without modifying the model."""
+    if not isinstance(model, LUMEModel):
+        raise TypeError("model must be a LUMEModel")
+    if not isinstance(transforms, (Mapping, torch.nn.ModuleDict)):
+        raise TypeError("provide a mapping of variable names to transforms")
+    for name, transform in transforms.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("transform names must be nonempty strings")
+        validate_bidirectional_transform(transform, name)
+    validate_transform_names(model, list(transforms))
+
+
+def validate_torch_transforms(model: LUMEModel) -> torch.nn.Module:
+    """Require and return a Torch-compatible underlying model."""
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("TorchModelWithTransforms requires an nn.Module")
+    return model
+
+
+def validate_transform_module(
+    transform: object, module_ids: set[int]
+) -> torch.nn.Module:
+    """Require an independent Torch transform module."""
+    if not isinstance(transform, torch.nn.Module):
+        raise TypeError("Torch transforms must be nn.Module instances")
+    validate_bidirectional_transform(transform, "Torch transform")
+    if id(transform) in module_ids:
+        raise ValueError("Torch transforms must be independent modules")
+    return transform

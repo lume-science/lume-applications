@@ -13,6 +13,7 @@ dependencies = [
     "lightning>=2.5",
     "pyro-ppl>=1.9",
     "cheetah-accelerator",
+    "lume-base",
     "lume-cheetah",
 ]
 
