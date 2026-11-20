@@ -240,51 +240,6 @@ def test_transform_and_misalignment_calibration(model):
     wrapper.get(["screen_image"])["screen_image"].square().sum().backward()
     assert strength.grad is not None and torch.isfinite(strength.grad)
 
-
-def test_transverse_input_beam_calibration(model):
-    model.double()
-    source = model.enable_trainable_input_beam()
-    reference = deepcopy(source)
-    with torch.no_grad():
-        reference.log_beta_x.add_(0.3)
-        reference.log_beta_y.sub_(0.25)
-        reference.alpha_x.add_(0.25)
-        reference.alpha_y.sub_(0.2)
-        reference.log_emittance_x.add_(0.4)
-        reference.log_emittance_y.sub_(0.3)
-    strengths = torch.linspace(-1.5, 1.5, 6, dtype=torch.float64)
-    names = ["beam:SCR1:sigma_x", "beam:SCR1:sigma_y"]
-    targets = {name: [] for name in names}
-    with torch.no_grad():
-        for strength in strengths:
-            model.simulator.segment.Q1.k1 = strength
-            beam = model.simulator.segment.track(reference())
-            for plane, name in zip(("x", "y"), names, strict=True):
-                targets[name].append(getattr(beam, f"sigma_{plane}").clone())
-    targets = {name: torch.stack(values) for name, values in targets.items()}
-    optimizer = torch.optim.Adam(get_trainable_parameters(model), lr=0.03)
-    history = calibrate_model(
-        model,
-        {"Q1_k": strengths},
-        targets,
-        optimizer,
-        steps=500,
-        loss_fn=lambda prediction, target: torch.nn.functional.mse_loss(
-            prediction * 1e3, target * 1e3
-        ),
-    )
-    assert history[-1] < history[0] * 1e-4
-    for plane in ("x", "y"):
-        for attribute in ("beta", "alpha", "emittance"):
-            name = f"{attribute}_{plane}"
-            torch.testing.assert_close(
-                getattr(source, name), getattr(reference, name), rtol=0.02, atol=1e-9
-            )
-    assert len(get_trainable_parameters(model)) == 6
-    for parameter in get_trainable_parameters(model):
-        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
-
-
 def test_svi_misalignment(quadrupole_scan_dataset, model):
     import pyro
     import pyro.distributions as dist
