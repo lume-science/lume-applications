@@ -1,5 +1,5 @@
 """Surrogate models for LUME applications."""
 
-from .beam_surrogate import NeuralNetworkBeamSurrogate
+from .beam_surrogate import NNBeam, NeuralNetworkBeamSurrogate
 
-__all__ = ["NeuralNetworkBeamSurrogate"]
+__all__ = ["NNBeam", "NeuralNetworkBeamSurrogate"]

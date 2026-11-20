@@ -1,7 +1,8 @@
 """Neural network-based beam source using CheetahFinalParticlesMixIn."""
 
 import math
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Any, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -62,64 +63,72 @@ class InputNormalizer:
         )
 
 
-class NNTwissBeam(torch.nn.Module):
-    """
-    Parameterization of an uncoupled transverse beam distribution with fixed longitudinal moments
-    as a function of machine parameters.
+class NNBeam(nn.Module):
+    """Neural beam parameterization with zero centroids and fixed reference energy.
 
-    This module defines a model of the transverse Twiss parameters (beta, alpha, emittance)
-    for both horizontal and vertical planes as a function of input parameters (machine settings).
-    Longitudinal moments are fixed and not learned. As a starting point for
-    optimization we ask the user to provide initial estimates for the normalized
-    emittance (emittance is still learned).
+    The network must preserve input batch dimensions and return (..., output_size):
 
-    Inputs are passed unchanged to the supplied network; NeuralNetworkBeamSurrogate
-    normalizes action values to [-1, 1]. The network must return a tensor of
-    shape (..., 6), preserving input batch dimensions, with the following values:
-    - log_beta_x: logarithm of the horizontal beta function
-    - alpha_x: horizontal alpha function
-    - log_epsilon_x_scale: logarithm of the horizontal emittance scale factor
-    - log_beta_y: logarithm of the vertical beta function
-    - alpha_y: vertical alpha function
-    - log_epsilon_y_scale: logarithm of the vertical emittance scale factor
+    - ``transverse_covariance``: 14 outputs for a 4x4 covariance in (x, px, y, py)
+      order: 4 log-diagonal entries, 6 strict-lower-triangular entries, then
+      4 log-scale multipliers.
+    - ``full_covariance``: 27 outputs for a 6x6 covariance in
+      (x, px, y, py, tau, p) order: 6 log-diagonal entries, 15 strict-lower-
+      triangular entries, then 6 log-scale multipliers.
 
-    True twiss parameters are calculated as:
-    - beta_x = max(0.1, exp(log_beta_x))
-    - alpha_x = alpha_x
-    - epsilon_x = initial_emittance * exp(log_epsilon_x_scale)
-    - beta_y = max(0.1, exp(log_beta_y))
-    - alpha_y = alpha_y
-    - epsilon_y = initial_emittance * exp(log_epsilon_y_scale)
+    Strict-lower entries fill L in row order: L[1,0], L[2,0], L[2,1], etc.
+    Diagonal entries of L are exponentiated. The row scales are
+    initial_scales * exp(log_scale_multipliers), and covariance is (D L) @ (D L).T,
+    where D is diagonal with those row scales. This gives positive-definite
+    covariance for a nonsingular finite factor and supports all correlations.
+    initial_scales are standard-deviation scales in coordinate units, not variances.
 
-    Here initial_emittance is normalized_emittance_scale divided by the electron's
-    relativistic beta * gamma. Network weights are not modified; initialize its
-    output to zero for beta = 1 m, alpha = 0 and the specified emittance scale.
+    Scale multipliers and L are always learned. The user-provided initial_scales
+    are fixed buffers.
+
+    Transverse mode requires sigma_tau and sigma_p, fixing the longitudinal
+    covariance to diag(sigma_tau**2, sigma_p**2) with zero transverse-longitudinal
+    correlations. Full mode takes all six scales through initial_scales and
+    does not accept sigma_tau or sigma_p.
+    Zero network outputs give covariance diag(initial_scales**2).
+    Network weights are not modified.
+
+    Returns (centroid, covariance, energy), with shapes (..., 6), (..., 6, 6)
+    and (...), compatible with NeuralNetworkBeamSurrogate.
     """
 
     def __init__(
         self,
         *,
         network: torch.nn.Module,
-        sigma_tau: float,
-        sigma_p: float,
-        normalized_emittance_scale: float,
+        initial_scales: Sequence[float] | torch.Tensor,
         energy: float,
+        mode: Literal[
+            "transverse_covariance", "full_covariance"
+        ] = "transverse_covariance",
+        sigma_tau: float | None = None,
+        sigma_p: float | None = None,
     ):
         """
-        Initialize the NNTwissBeam module.
+        Initialize the selected beam parameterization.
 
         Parameters
         ----------
         network : torch.nn.Module
-            Neural network module predicting transverse Twiss parameters.
-        sigma_tau : float
-            Fixed RMS bunch length in metres.
-        sigma_p : float
-            Fixed relative RMS momentum spread.
-        normalized_emittance_scale : float
-            Initial normalized emittance in m rad for each transverse plane.
+            Neural network module predicting distribution parameters.
+            Its weights are not modified.
+        initial_scales : sequence of float or torch.Tensor
+            Positive finite scale vector of length 4 or 6, in coordinate order.
         energy : float
             Total electron energy in eV.
+        mode : str, optional
+            transverse_covariance (14 outputs, default) or full_covariance
+            (27 outputs).
+        sigma_tau : float, optional
+            Required fixed RMS bunch length in metres for transverse mode.
+            Must be omitted in full mode.
+        sigma_p : float, optional
+            Required fixed relative RMS momentum spread for transverse mode.
+            Must be omitted in full mode.
         """
 
         super().__init__()
@@ -127,138 +136,86 @@ class NNTwissBeam(torch.nn.Module):
         if not isinstance(network, nn.Module):
             raise TypeError("network must be a torch.nn.Module.")
         self.network = network
-        for name, value in {
-            "sigma_tau": sigma_tau,
-            "sigma_p": sigma_p,
-            "normalized_emittance_scale": normalized_emittance_scale,
-            "energy": energy,
-        }.items():
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be finite and positive.")
+        dimensions = {
+            "transverse_covariance": 4,
+            "full_covariance": 6,
+        }
+        if mode not in dimensions:
+            raise ValueError(
+                f"Unknown beam mode {mode!r}; choose from {tuple(dimensions)}."
+            )
+        self.mode = mode
+        self.dimension = dimensions[mode]
+        self.factor_size = self.dimension * (self.dimension + 1) // 2
+        self.output_size = self.factor_size + self.dimension
+        scales = torch.as_tensor(initial_scales, dtype=torch.float64).detach().clone()
+        if (
+            scales.shape != (self.dimension,)
+            or not torch.isfinite(scales).all()
+            or not (scales > 0).all()
+        ):
+            raise ValueError(
+                f"initial_scales must contain {self.dimension} finite positive values."
+            )
+        self.register_buffer("initial_scales", scales)
+        if not math.isfinite(energy) or energy <= 0:
+            raise ValueError("energy must be finite and positive.")
         rest_energy = Species("electron", dtype=torch.float64).mass_eV
         if energy <= rest_energy.item():
             raise ValueError("energy must exceed the electron rest energy.")
         self.register_buffer("energy", torch.tensor(energy, dtype=torch.float64))
-        beta_gamma = torch.sqrt((self.energy / rest_energy).square() - 1)
-        self.register_buffer(
-            "normalized_emittance_scale", normalized_emittance_scale / beta_gamma
-        )
-        self.register_buffer(
-            "longitudinal_covariance",
-            torch.diag(
+        longitudinal_covariance: torch.Tensor | None = None
+        if mode == "transverse_covariance":
+            for name, value in {"sigma_tau": sigma_tau, "sigma_p": sigma_p}.items():
+                if value is None:
+                    raise ValueError(f"{name} is required for {mode} mode.")
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive.")
+            longitudinal_covariance = torch.diag(
                 torch.tensor([sigma_tau, sigma_p], dtype=torch.float64).square()
-            ),
-        )
+            )
+        elif sigma_tau is not None or sigma_p is not None:
+            raise ValueError(
+                "sigma_tau and sigma_p are only accepted in transverse_covariance mode; "
+                "provide all six initial_scales for full_covariance."
+            )
+        self.register_buffer("longitudinal_covariance", longitudinal_covariance)
 
     def forward(
         self, inputs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        delta = self.network(inputs)
+        values = self.network(inputs)
         if (
-            not isinstance(delta, torch.Tensor)
-            or delta.ndim == 0
-            or delta.shape[-1] != 6
+            not isinstance(values, torch.Tensor)
+            or values.ndim == 0
+            or values.shape[-1] != self.output_size
         ):
             raise ValueError(
-                "The Twiss network must return a tensor with shape (..., 6)."
+                f"The {self.mode} network must return a tensor with shape "
+                f"(..., {self.output_size})."
             )
-        covariance = delta.new_zeros(*delta.shape[:-1], 6, 6)
-        for offset in (0, 3):
-            beta = delta[..., offset].exp().clamp(min=0.1)
-            alpha = delta[..., offset + 1]
-            emittance = self.normalized_emittance_scale * delta[..., offset + 2].exp()
-            plane = 0 if offset == 0 else 2
-            covariance[..., plane, plane] = beta * emittance
-            covariance[..., plane, plane + 1] = -alpha * emittance
-            covariance[..., plane + 1, plane] = -alpha * emittance
-            covariance[..., plane + 1, plane + 1] = (
-                (1 + alpha.square()) * emittance / beta
-            )
-        covariance[..., 4:6, 4:6] = self.longitudinal_covariance
+        covariance = self._cholesky_covariance(values)
+        batch_shape = values.shape[:-1]
+        if self.longitudinal_covariance is not None:
+            transverse_covariance = covariance
+            covariance = values.new_zeros(*batch_shape, 6, 6)
+            covariance[..., :4, :4] = transverse_covariance
+            covariance[..., 4:6, 4:6] = self.longitudinal_covariance
         return (
-            delta.new_zeros(*delta.shape[:-1], 6),
+            covariance.new_zeros(*batch_shape, 6),
             covariance,
-            self.energy.expand(delta.shape[:-1]),
+            self.energy.expand(batch_shape),
         )
 
-
-class MomentNetwork(torch.nn.Module):
-    """A coupled, action-dependent distribution with trainable moments and energy."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear = torch.nn.Linear(1, 13)
-        with torch.no_grad():
-            self.linear.weight.fill_(0.1)
-            self.linear.bias.copy_(torch.linspace(0.1, 1.3, 13))
-        self.register_buffer("coupling", torch.ones(6, 6).tril(-1) * 1e-5)
-
-    def forward(self, inputs):
-        values = self.linear(inputs)
-        centroid = values[..., :6] * 1e-3
-        scale = torch.diag_embed(values[..., 6:12].exp() * 1e-4) + self.coupling
-        return centroid, scale @ scale.mT, values[..., 12].exp() * 1e8
-
-
-class TwissParameterNetwork(nn.Module):
-    """
-    Neural network that maps input variables to Twiss parameters.
-
-    This network takes input variables and outputs Twiss parameters
-    (beta_x, alpha_x, log_emittance_x, beta_y, alpha_y, log_emittance_y, energy)
-    that can be used to create a Cheetah ParticleBeam via from_twiss.
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        hidden_sizes: list[int] = None,
-        output_size: int = 7,
-    ):
-        """
-        Initialize the Twiss parameter network.
-
-        Parameters
-        ----------
-        input_size : int
-            Number of input variables
-        hidden_sizes : list[int], optional
-            Sizes of hidden layers. Default: [64, 32]
-        output_size : int, optional
-            Number of Twiss parameters to output. Default: 7
-        """
-        super().__init__()
-
-        if hidden_sizes is None:
-            hidden_sizes = [64, 32]
-
-        layers = []
-        prev_size = input_size
-
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(prev_size, hidden_size))
-            layers.append(nn.ReLU())
-            prev_size = hidden_size
-
-        layers.append(nn.Linear(prev_size, output_size))
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the network.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape (batch_size, input_size)
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor of shape (batch_size, output_size)
-        """
-        return self.network(x)
+    def _cholesky_covariance(self, values: torch.Tensor) -> torch.Tensor:
+        factor = torch.diag_embed(values[..., : self.dimension].exp())
+        rows, columns = torch.tril_indices(
+            self.dimension, self.dimension, offset=-1, device=values.device
+        )
+        factor[..., rows, columns] = values[..., self.dimension : self.factor_size]
+        scales = self.initial_scales * values[..., self.factor_size :].exp()
+        factor = factor * scales.unsqueeze(-1)
+        return factor @ factor.mT
 
 
 class NeuralNetworkBeamSurrogate(LUMEModel, nn.Module, CheetahFinalParticlesMixIn):
