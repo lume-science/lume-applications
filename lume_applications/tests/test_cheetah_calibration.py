@@ -1,4 +1,5 @@
 from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -397,6 +398,51 @@ def additive_model():
             return {name: outputs[name] for name in names}
 
     return AdditiveModel()
+
+
+@pytest.mark.parametrize("samples", [1, 3])
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+def test_calibration_batches_set_get_without_changing_loss(
+    additive_model, samples, reduction
+):
+    inputs = {
+        "first": torch.arange(samples * 2, dtype=torch.float32).reshape(samples, 2),
+        "second": torch.ones(samples, 2),
+    }
+    targets = {"value": torch.zeros(samples, 2), "double": torch.ones(samples, 2)}
+
+    def loss_fn(prediction, target):
+        return torch.nn.functional.mse_loss(prediction, target, reduction=reduction)
+
+    calibration = CalibrationModule(
+        additive_model,
+        inputs,
+        targets,
+        torch.optim.SGD([additive_model.offset], lr=0.01),
+        loss_fn=loss_fn,
+        loss_weights={"double": 0.25},
+    )
+    expected_prediction = inputs["first"] + inputs["second"] + additive_model.offset
+    expected = sum(
+        loss_fn(prediction, target) + 0.25 * loss_fn(2 * prediction, double_target)
+        for prediction, target, double_target in zip(
+            expected_prediction, targets["value"], targets["double"], strict=True
+        )
+    )
+    expected_gradient = torch.autograd.grad(expected, additive_model.offset)[0]
+    with (
+        patch.object(additive_model, "set", wraps=additive_model.set) as set_values,
+        patch.object(additive_model, "get", wraps=additive_model.get) as get_values,
+    ):
+        total, _ = calibration.evaluate_loss(calibration.inputs, calibration.targets)
+    set_values.assert_called_once()
+    get_values.assert_called_once_with(["value", "double"])
+    for name in inputs:
+        torch.testing.assert_close(set_values.call_args.args[0][name], inputs[name])
+    torch.testing.assert_close(total, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(total, additive_model.offset)[0], expected_gradient
+    )
 
 
 @pytest.mark.parametrize("use_trainer", [False, True])
