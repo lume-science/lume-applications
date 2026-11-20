@@ -240,6 +240,7 @@ def test_transform_and_misalignment_calibration(model):
     wrapper.get(["screen_image"])["screen_image"].square().sum().backward()
     assert strength.grad is not None and torch.isfinite(strength.grad)
 
+
 def test_svi_misalignment(quadrupole_scan_dataset, model):
     import pyro
     import pyro.distributions as dist

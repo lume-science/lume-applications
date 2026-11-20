@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import torch
 from lightning.pytorch import LightningModule, Trainer
@@ -223,6 +224,7 @@ def calibrate_model(
     steps: int,
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = mse_loss,
     loss_weights: Mapping[str, float] | None = None,
+    **kwargs: Any,
 ) -> list[float]:
     """
         Fit in place a lume-style differentiable model with a single-device
@@ -249,6 +251,8 @@ def calibrate_model(
         The loss function to use for calibration (default is mse_loss).
     loss_weights : Mapping[str, float] | None, optional
         The weights for each target loss (default is None).
+    **kwargs : Any
+        Additional keyword arguments to pass to the Lightning Trainer object.
     """
     validate_positive_integer(steps, "steps")
     calibration = CalibrationModule(
@@ -259,14 +263,6 @@ def calibrate_model(
         loss_fn=loss_fn,
         loss_weights=loss_weights,
     )
-    trainer = Trainer(
-        devices=1,
-        max_steps=steps,
-        max_epochs=-1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=True,
-        enable_model_summary=False,
-    )
+    trainer = Trainer(max_steps=steps, **kwargs)
     trainer.fit(calibration)
     return calibration.loss_history
