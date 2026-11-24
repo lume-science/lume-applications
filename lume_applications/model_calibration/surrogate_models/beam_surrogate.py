@@ -2,8 +2,12 @@
 
 import math
 from collections.abc import Sequence
+from contextlib import nullcontext
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Literal, Optional
 
+import h5py
 import torch
 import torch.nn as nn
 from cheetah.particles import ParticleBeam, Species
@@ -471,6 +475,51 @@ class NeuralNetworkBeamSurrogate(LUMEModel, nn.Module, CheetahFinalParticlesMixI
         """Restore initial PV inputs without resetting fitted network parameters."""
         for i, buffer in enumerate(self._input_buffers.values()):
             setattr(self, buffer, getattr(self, f"_default_{i}").clone())
+
+    def to_archive(self, location: str | Path | h5py.Group) -> None:
+        """Save the complete surrogate as a PyTorch payload in an HDF5 archive.
+
+        Includes the network architecture, weights, beam settings, variable
+        definitions, current inputs, reset defaults, and train/eval flags.
+        Custom network classes must be importable when loading; locally defined
+        classes and lambdas are not supported by PyTorch's pickle serializer.
+        Optimizer state and existing autograd graphs are not archived.
+
+        A file path is overwritten. A supplied group is left open and must not
+        already contain a dataset named ``model``.
+        """
+        payload = BytesIO()
+        torch.save(self, payload)
+        with (
+            h5py.File(location, "w")
+            if isinstance(location, (str, Path))
+            else nullcontext(location)
+        ) as archive:
+            archive.create_dataset(
+                "model", data=bytearray(payload.getvalue()), dtype="u1"
+            )
+
+    @classmethod
+    def from_archive(
+        cls, location: str | Path | h5py.Group
+    ) -> "NeuralNetworkBeamSurrogate":
+        """Reload a complete surrogate on CPU, preserving its saved dtype.
+
+        Only load trusted archives: restoring the full network uses pickle and
+        can execute arbitrary code. Custom network classes must be importable
+        in the loading environment. Use ``model.to(...)`` to move the restored
+        model to another device or dtype. Caller-owned HDF5 groups remain open.
+        """
+        with (
+            h5py.File(location, "r")
+            if isinstance(location, (str, Path))
+            else nullcontext(location)
+        ) as archive:
+            payload = BytesIO(archive["model"][()].tobytes())
+        model = torch.load(payload, map_location="cpu", weights_only=False)
+        if not isinstance(model, cls):
+            raise TypeError(f"The archive must contain a {cls.__name__} instance.")
+        return model
 
     @property
     def supported_variables(self) -> dict[str, Variable]:

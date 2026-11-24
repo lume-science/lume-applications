@@ -1,7 +1,11 @@
 from collections.abc import Mapping
+from contextlib import nullcontext
+from io import BytesIO
 from itertools import chain
+from pathlib import Path
 from typing import Any
 
+import h5py
 import torch
 from lume.model import LUMEModel
 from lume.variables import Variable
@@ -241,3 +245,120 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
     def transform_parameters(self) -> list[torch.nn.Parameter]:
         """Return unique trainable transform parameters, excluding simulator parameters."""
         return get_trainable_parameters(self.transforms)
+
+    def to_archive(self, location: str | Path | h5py.Group) -> None:
+        """
+        Archive the wrapped model and transforms to an HDF5 file or group.
+
+        Delegates model archiving to the base LUMEModel, then stores transform state.
+
+        Parameters
+        ----------
+        location : str | Path | h5py.Group
+            Path to an HDF5 file (created or overwritten) or an open HDF5 group.
+        """
+        with (
+            h5py.File(location, "w")
+            if isinstance(location, (str, Path))
+            else nullcontext(location)
+        ) as archive:
+            # Store model class for restoration
+            archive.attrs["model_class"] = f"{self.model.__class__.__module__}.{self.model.__class__.__name__}"
+            # Let the base model handle its own archiving to its group
+            self.model.to_archive(archive)
+            
+            # Store transform state separately
+            state_bytes = _serialize_dict(self.transforms.state_dict())
+            archive.create_dataset(
+                "transforms_state",
+                data=bytearray(state_bytes),
+                dtype="u1",
+            )
+            archive.attrs["transform_names"] = list(self.transforms.keys())
+
+    @classmethod
+    def from_archive(cls, location: str | Path | h5py.Group) -> "TorchModelWithTransforms":
+        """
+        Restore a model instance from an archived HDF5 file or group.
+
+        Expects the base model to have its own from_archive method implemented.
+        Restores transforms from stored state.
+
+        Parameters
+        ----------
+        location : str | Path | h5py.Group
+            Path to an HDF5 file or an open HDF5 group.
+
+        Returns
+        -------
+        TorchModelWithTransforms
+            The fully reconstructed model with loaded weights and transforms.
+        """
+        with (
+            h5py.File(location, "r")
+            if isinstance(location, (str, Path))
+            else nullcontext(location)
+        ) as archive:
+            # Import to get access to the actual model class
+            # The base model must implement its own from_archive
+            # We'll try to find which model subclass was used and call its from_archive
+            import importlib
+            
+            # Try to restore using model_class attribute if available
+            if "model_class" in archive.attrs:
+                model_class_path = archive.attrs["model_class"]
+                module_name, class_name = model_class_path.rsplit(".", 1)
+                module = importlib.import_module(module_name)
+                ModelClass = getattr(module, class_name)
+                base_model = ModelClass.from_archive(archive)
+            else:
+                raise ValueError(
+                    "Archive must contain 'model_class' attribute to identify the model type"
+                )
+            
+            # Restore transform state
+            if "transforms_state" in archive:
+                transforms_state = torch.load(
+                    BytesIO(archive["transforms_state"][()].tobytes()),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                transform_names = archive.attrs.get("transform_names", [])
+                
+                # Recreate transforms from state
+                transforms = {}
+                for name in transform_names:
+                    transform = TorchAffineTransform()
+                    prefix = f"{name}."
+                    transform_params = {
+                        k[len(prefix):]: v
+                        for k, v in transforms_state.items()
+                        if k.startswith(prefix)
+                    }
+                    if transform_params:
+                        transform.load_state_dict(transform_params)
+                    transforms[name] = transform
+            else:
+                transforms = {}
+        
+        return cls(base_model, transforms)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load state into model and transforms.
+
+        Parameters
+        ----------
+        state_dict : dict
+            State dictionary with model and transform states.
+        strict : bool
+            Passed to underlying nn.Module.load_state_dict()
+        """
+        super().load_state_dict(state_dict, strict=strict)
+
+
+def _serialize_dict(data: dict) -> bytes:
+    """Serialize a dictionary (for pickle-safe state storage)."""
+    buffer = BytesIO()
+    torch.save(data, buffer)
+    return buffer.getvalue()

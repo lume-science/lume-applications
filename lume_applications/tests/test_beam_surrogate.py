@@ -2,6 +2,7 @@
 
 import math
 
+import h5py
 import pytest
 import torch
 from cheetah.particles import ParticleBeam, Species
@@ -378,6 +379,82 @@ class MomentNetwork(torch.nn.Module):
 
 class TestNeuralNetworkBeamSurrogate:
     """Test the NeuralNetworkBeamSurrogate class."""
+
+    @pytest.mark.parametrize("location_kind", ["path", "string", "group"])
+    def test_archive_round_trip(
+        self, simple_input_variables, nn_beam, tmp_path, location_kind
+    ):
+        model = NeuralNetworkBeamSurrogate(
+            action_variables=simple_input_variables,
+            network=nn_beam,
+            num_particles=64,
+            total_charge=1e-12,
+            s=1.25,
+            species="positron",
+            dtype=torch.float64,
+        )
+        with torch.no_grad():
+            nn_beam.network[-1].weight.fill_(0.1)
+            nn_beam.network[-1].bias.fill_(0.05)
+        model.eval()
+        inputs = torch.tensor(
+            [[-0.5, 0.0], [0.5, 1.0]], dtype=torch.float64, requires_grad=True
+        )
+        model.set({"Q1_k": inputs * 0.5})
+        expected = model.cheetah_final_particles
+        path = tmp_path / "surrogate.h5"
+        if location_kind == "group":
+            with h5py.File(path, "w") as archive:
+                archive.create_dataset("unrelated", data=42)
+                group = archive.create_group("surrogate")
+                model.to_archive(group)
+                restored = NeuralNetworkBeamSurrogate.from_archive(group)
+                assert group.id.valid
+                assert archive["unrelated"][()] == 42
+        else:
+            location = str(path) if location_kind == "string" else path
+            model.to_archive(location)
+            restored = NeuralNetworkBeamSurrogate.from_archive(location)
+
+        assert restored is not model
+        assert restored.network is not model.network
+        assert restored.dtype == torch.float64
+        assert restored.device == torch.device("cpu")
+        assert not restored.training
+        assert not restored.network.training
+        assert isinstance(restored.supported_variables["Q1_k"], TorchScalarVariable)
+        assert restored.supported_variables["Q1_k"].value_range == (-2.0, 2.0)
+        torch.testing.assert_close(restored.get_value("Q1_k"), model.get_value("Q1_k"))
+        actual = restored.cheetah_final_particles
+        for name in ("particles", "energy", "total_charge", "s"):
+            torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+        assert actual.species.name == "positron"
+
+        restored.train()
+        optimizer = torch.optim.SGD(restored.parameters(), lr=1e-3)
+        before = restored.network.network[-1].bias.detach().clone()
+        (actual.sigma_x.square().sum() / 1e-8).backward()
+        assert restored.network.network[-1].bias.grad is not None
+        optimizer.step()
+        assert not torch.equal(restored.network.network[-1].bias, before)
+        restored.reset()
+        torch.testing.assert_close(
+            restored.get_value("Q1_k"), torch.tensor(1.0, dtype=torch.float64)
+        )
+        assert not torch.equal(restored.network.network[-1].bias, before)
+
+    def test_archive_custom_network(self, simple_input_variables, tmp_path):
+        model = NeuralNetworkBeamSurrogate(
+            simple_input_variables, MomentNetwork(), num_particles=64
+        )
+        path = tmp_path / "custom.h5"
+        model.to_archive(path)
+        restored = NeuralNetworkBeamSurrogate.from_archive(path)
+        assert isinstance(restored.network, MomentNetwork)
+        torch.testing.assert_close(
+            restored.cheetah_final_particles.particles,
+            model.cheetah_final_particles.particles,
+        )
 
     def test_initialization_with_network(self, simple_input_variables):
         """Test initialization with pre-instantiated network."""
