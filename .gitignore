@@ -235,3 +235,5 @@ __marimo__/
 
 # dev
 dev/
+
+lightning_logs/

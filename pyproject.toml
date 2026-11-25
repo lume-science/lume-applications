@@ -9,12 +9,13 @@ description = "Reusable model calibration workflows for LUME simulation models"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "h5py",
     "torch>=2.0",
     "lightning>=2.5",
     "pyro-ppl>=1.9",
     "cheetah-accelerator",
     "lume-base",
-    "lume-cheetah",
+    "lume-cheetah @ git+https://github.com/lume-science/lume-cheetah.git",
 ]
 
 [project.optional-dependencies]
