@@ -270,7 +270,9 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
             # Check if this is a staged model
             # If so, we need to put the base model in a subgroup to avoid
             # conflicts with transforms_state at the root level
-            is_staged = hasattr(self.model, "lume_model_instances")
+            is_staged = isinstance(self.model, TorchModelWithTransforms) or hasattr(
+                self.model, "lume_model_instances"
+            )
 
             if is_staged:
                 # Create a "model" subgroup for the staged model
@@ -368,13 +370,17 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
                 # Recreate transforms from state
                 transforms = {}
                 for name in transform_names:
-                    transform = TorchAffineTransform()
                     prefix = f"{name}."
                     transform_params = {
                         k[len(prefix) :]: v
                         for k, v in transforms_state.items()
                         if k.startswith(prefix)
                     }
+                    transform = TorchAffineTransform(
+                        dtype=transform_params["scale"].dtype
+                        if "scale" in transform_params
+                        else None
+                    )
                     if transform_params:
                         transform.load_state_dict(transform_params)
                     transforms[name] = transform
@@ -394,7 +400,7 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
         strict : bool
             Passed to underlying nn.Module.load_state_dict()
         """
-        super().load_state_dict(state_dict, strict=strict)
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 def _serialize_dict(data: dict) -> bytes:
