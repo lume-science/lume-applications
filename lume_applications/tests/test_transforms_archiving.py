@@ -24,7 +24,7 @@ from lume_applications.model_calibration import (
 class ArchivableTorchModel(LUMEModel, torch.nn.Module):
     """
     A simple archivable torch model for testing.
-    
+
     This model is designed to be easily archivable, allowing us to test
     the TorchModelWithTransforms archiving.
     """
@@ -47,7 +47,11 @@ class ArchivableTorchModel(LUMEModel, torch.nn.Module):
         self.input_value = values.get("input", torch.tensor(0.0, dtype=torch.float64))
 
     def _get(self, names):
-        x = self.input_value.view(1, 1) if self.input_value.dim() == 0 else self.input_value
+        x = (
+            self.input_value.view(1, 1)
+            if self.input_value.dim() == 0
+            else self.input_value
+        )
         with torch.no_grad():
             y = torch.relu(self.linear1(x))
             y = self.linear2(y)
@@ -86,7 +90,9 @@ class ArchivableTorchModel(LUMEModel, torch.nn.Module):
 
             # Restore state dict
             state_bytes = archive["model_state"][()].tobytes()
-            state_dict = torch.load(BytesIO(state_bytes), map_location="cpu", weights_only=True)
+            state_dict = torch.load(
+                BytesIO(state_bytes), map_location="cpu", weights_only=True
+            )
             model.load_state_dict(state_dict)
 
         return model
@@ -287,7 +293,7 @@ class TestTransformsArchiving:
         """Test that state_dict can be loaded correctly."""
         state_dict = model.state_dict()
         assert len(state_dict) > 0
-        
+
         # Create new model and load state
         new_model = TorchModelWithTransforms(
             ArchivableTorchModel(hidden_size=4),
