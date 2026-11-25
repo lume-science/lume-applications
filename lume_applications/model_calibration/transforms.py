@@ -257,6 +257,17 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
         location : str | Path | h5py.Group
             Path to an HDF5 file (created or overwritten) or an open HDF5 group.
         """
+        unsupported = [
+            type(transform).__name__
+            for transform in self.transforms.values()
+            if type(transform) is not TorchAffineTransform
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "Archiving only supports TorchAffineTransform; "
+                f"unsupported transforms: {', '.join(unsupported)}"
+            )
+
         with (
             h5py.File(location, "w")
             if isinstance(location, (str, Path))

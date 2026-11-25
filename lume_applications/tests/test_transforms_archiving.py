@@ -92,6 +92,14 @@ class ArchivableTorchModel(LUMEModel, torch.nn.Module):
         return model
 
 
+class CustomTorchAffineTransform(TorchAffineTransform):
+    def transform(self, value):
+        return super().transform(value).square()
+
+    def untransform(self, value):
+        return super().untransform(value).sqrt()
+
+
 class TestTransformsArchiving:
     """Test archiving of TorchModelWithTransforms."""
 
@@ -111,6 +119,19 @@ class TestTransformsArchiving:
             model.to_archive(archive_path)
             assert archive_path.exists()
             assert archive_path.stat().st_size > 0
+
+    def test_archive_rejects_unsupported_transform(self):
+        model = TorchModelWithTransforms(
+            ArchivableTorchModel(),
+            {"input": CustomTorchAffineTransform()},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / "unsupported.h5"
+            with pytest.raises(
+                NotImplementedError, match="only supports TorchAffineTransform"
+            ):
+                model.to_archive(archive_path)
+            assert not archive_path.exists()
 
     def test_archive_to_h5py_group(self, model):
         """Test that archiving to an HDF5 group works."""
