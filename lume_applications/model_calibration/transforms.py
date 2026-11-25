@@ -292,7 +292,7 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
 
     @classmethod
     def from_archive(
-        cls, location: str | Path | h5py.Group, model_registry: dict | None = None
+        cls, location: str | Path | h5py.Group
     ) -> "TorchModelWithTransforms":
         """
         Restore a model instance from an archived HDF5 file or group.
@@ -304,9 +304,6 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
         ----------
         location : str | Path | h5py.Group
             Path to an HDF5 file or an open HDF5 group.
-        model_registry : dict, optional
-            Registry of model classes for loading nested/staged models.
-            Only needed if the base model (e.g., StagedModel) requires it.
 
         Returns
         -------
@@ -337,20 +334,7 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
                 else:
                     model_archive = archive
 
-                # Try to call from_archive with model_registry if the method accepts it
-                try:
-                    if model_registry is not None:
-                        base_model = ModelClass.from_archive(
-                            model_archive, model_registry
-                        )
-                    else:
-                        base_model = ModelClass.from_archive(model_archive)
-                except TypeError as te:
-                    # If it fails with wrong number of arguments, try the other way
-                    if model_registry is not None and "positional argument" in str(te):
-                        base_model = ModelClass.from_archive(model_archive)
-                    else:
-                        raise
+                base_model = ModelClass.from_archive(model_archive)
             else:
                 raise ValueError(
                     "Archive must contain 'model_class' attribute to identify the model type"
