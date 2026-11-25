@@ -263,11 +263,24 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
             else nullcontext(location)
         ) as archive:
             # Store model class for restoration
-            archive.attrs["model_class"] = f"{self.model.__class__.__module__}.{self.model.__class__.__name__}"
-            # Let the base model handle its own archiving to its group
-            self.model.to_archive(archive)
-            
-            # Store transform state separately
+            archive.attrs["model_class"] = (
+                f"{self.model.__class__.__module__}.{self.model.__class__.__name__}"
+            )
+
+            # Check if this is a staged model
+            # If so, we need to put the base model in a subgroup to avoid
+            # conflicts with transforms_state at the root level
+            is_staged = hasattr(self.model, "lume_model_instances")
+
+            if is_staged:
+                # Create a "model" subgroup for the staged model
+                models_group = archive.create_group("model")
+                self.model.to_archive(models_group)
+            else:
+                # For simple models, archive directly to the root
+                self.model.to_archive(archive)
+
+            # Store transform state at root level
             state_bytes = _serialize_dict(self.transforms.state_dict())
             archive.create_dataset(
                 "transforms_state",
@@ -275,9 +288,12 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
                 dtype="u1",
             )
             archive.attrs["transform_names"] = list(self.transforms.keys())
+            archive.attrs["is_staged"] = is_staged
 
     @classmethod
-    def from_archive(cls, location: str | Path | h5py.Group) -> "TorchModelWithTransforms":
+    def from_archive(
+        cls, location: str | Path | h5py.Group, model_registry: dict | None = None
+    ) -> "TorchModelWithTransforms":
         """
         Restore a model instance from an archived HDF5 file or group.
 
@@ -288,6 +304,9 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
         ----------
         location : str | Path | h5py.Group
             Path to an HDF5 file or an open HDF5 group.
+        model_registry : dict, optional
+            Registry of model classes for loading nested/staged models.
+            Only needed if the base model (e.g., StagedModel) requires it.
 
         Returns
         -------
@@ -303,19 +322,40 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
             # The base model must implement its own from_archive
             # We'll try to find which model subclass was used and call its from_archive
             import importlib
-            
+
             # Try to restore using model_class attribute if available
             if "model_class" in archive.attrs:
                 model_class_path = archive.attrs["model_class"]
                 module_name, class_name = model_class_path.rsplit(".", 1)
                 module = importlib.import_module(module_name)
                 ModelClass = getattr(module, class_name)
-                base_model = ModelClass.from_archive(archive)
+
+                # Check if this is a staged model - if so, look in the "model" subgroup
+                is_staged = archive.attrs.get("is_staged", False)
+                if is_staged and "model" in archive:
+                    model_archive = archive["model"]
+                else:
+                    model_archive = archive
+
+                # Try to call from_archive with model_registry if the method accepts it
+                try:
+                    if model_registry is not None:
+                        base_model = ModelClass.from_archive(
+                            model_archive, model_registry
+                        )
+                    else:
+                        base_model = ModelClass.from_archive(model_archive)
+                except TypeError as te:
+                    # If it fails with wrong number of arguments, try the other way
+                    if model_registry is not None and "positional argument" in str(te):
+                        base_model = ModelClass.from_archive(model_archive)
+                    else:
+                        raise
             else:
                 raise ValueError(
                     "Archive must contain 'model_class' attribute to identify the model type"
                 )
-            
+
             # Restore transform state
             if "transforms_state" in archive:
                 transforms_state = torch.load(
@@ -324,14 +364,14 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
                     weights_only=True,
                 )
                 transform_names = archive.attrs.get("transform_names", [])
-                
+
                 # Recreate transforms from state
                 transforms = {}
                 for name in transform_names:
                     transform = TorchAffineTransform()
                     prefix = f"{name}."
                     transform_params = {
-                        k[len(prefix):]: v
+                        k[len(prefix) :]: v
                         for k, v in transforms_state.items()
                         if k.startswith(prefix)
                     }
@@ -340,7 +380,7 @@ class TorchModelWithTransforms(ModelWithTransforms, torch.nn.Module):
                     transforms[name] = transform
             else:
                 transforms = {}
-        
+
         return cls(base_model, transforms)
 
     def load_state_dict(self, state_dict, strict=True):
